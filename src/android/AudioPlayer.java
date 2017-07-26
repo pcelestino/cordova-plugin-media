@@ -24,6 +24,8 @@ import android.media.MediaPlayer.OnCompletionListener;
 import android.media.MediaPlayer.OnErrorListener;
 import android.media.MediaPlayer.OnPreparedListener;
 import android.media.MediaRecorder;
+import android.media.AudioFormat;
+import android.media.AudioRecord;
 import android.os.Environment;
 
 import org.apache.cordova.LOG;
@@ -85,13 +87,19 @@ public class AudioPlayer implements OnCompletionListener, OnPreparedListener, On
     private String audioFile = null;        // File name to play or record to
     private float duration = -1;            // Duration of audio
 
-    private MediaRecorder recorder = null;  // Audio recording object
+    private AudioRecord recorder = null;  // Audio recording object
     private LinkedList<String> tempFiles = null; // Temporary recording file name
     private String tempFile = null;
 
     private MediaPlayer player = null;      // Audio player object
     private boolean prepareOnly = true;     // playback after file prepare flag
     private int seekOnPrepared = 0;     // seek to this location once media is prepared
+
+    private Thread streamThread;
+    private int sampleRate = 8000; //44100;
+    private int channelConfig = AudioFormat.CHANNEL_IN_MONO;
+    private int audioFormat = AudioFormat.ENCODING_PCM_16BIT;
+    int minBufSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat);
 
     /**
      * Constructor.
@@ -109,9 +117,9 @@ public class AudioPlayer implements OnCompletionListener, OnPreparedListener, On
     private String generateTempFile() {
       String tempFileName = null;
       if (Environment.getExternalStorageState().equals(Environment.MEDIA_MOUNTED)) {
-          tempFileName = Environment.getExternalStorageDirectory().getAbsolutePath() + "/tmprecording-" + System.currentTimeMillis() + ".3gp";
+          tempFileName = Environment.getExternalStorageDirectory().getAbsolutePath() + "/tmprecording-" + System.currentTimeMillis() + ".raw";
       } else {
-          tempFileName = "/data/data/" + handler.cordova.getActivity().getPackageName() + "/cache/tmprecording-" + System.currentTimeMillis() + ".3gp";
+          tempFileName = "/data/data/" + handler.cordova.getActivity().getPackageName() + "/cache/tmprecording-" + System.currentTimeMillis() + ".raw";
       }
       return tempFileName;
     }
@@ -148,25 +156,52 @@ public class AudioPlayer implements OnCompletionListener, OnPreparedListener, On
             sendErrorStatus(MEDIA_ERR_ABORTED);
             break;
         case NONE:
-            this.audioFile = file;
-            this.recorder = new MediaRecorder();
-            this.recorder.setAudioSource(MediaRecorder.AudioSource.MIC);
-            this.recorder.setOutputFormat(MediaRecorder.OutputFormat.AAC_ADTS); // RAW_AMR);
-            this.recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC); //AMR_NB);
-            this.tempFile = generateTempFile();
-            this.recorder.setOutputFile(this.tempFile);
-            try {
-                this.recorder.prepare();
-                this.recorder.start();
-                this.setState(STATE.MEDIA_RUNNING);
-                return;
-            } catch (IllegalStateException e) {
-                e.printStackTrace();
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
 
-            sendErrorStatus(MEDIA_ERR_ABORTED);
+            if (this.state == STATE.MEDIA_STOPPED) {
+                this.streamThread = new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+
+                            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO);
+                            
+                            this.setState(STATE.MEDIA_RUNNING);
+                            this.audioFile = file;
+
+                            byte[] buffer = new byte[4096];
+
+                            recorder = new AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, channelConfig, audioFormat, minBufSize * 10);
+
+                            recorder.startRecording();
+
+                            /////Encoding:
+                            CMG711 encoder = new CMG711();
+                            byte[] outBuffer = new byte[4096];
+                            this.tempFile = generateTempFile();
+
+                            int read, encoded;
+                            FileOutputStream out = new FileOutputStream(new File(this.tempFile));
+
+                            while(this.state == STATE.MEDIA_RUNNING) {
+
+                                //reading data from MIC into buffer
+                                read = recorder.read(buffer, 0, buffer.length);
+
+                                //Encoding:
+                                encoded = encoder.encode(buffer, 0, read, outBuffer);
+
+                                out.write(outBuffer, 0, encoded);
+                            }
+
+                        } catch (IOException e) {
+                            e.printStackTrace();
+                            sendErrorStatus(MEDIA_ERR_ABORTED);
+                        }
+                    }
+                });
+                streamThread.start();
+            }
+             
             break;
         case RECORD:
             LOG.d(LOG_TAG, "AudioPlayer Error: Already recording.");
@@ -262,8 +297,11 @@ public class AudioPlayer implements OnCompletionListener, OnPreparedListener, On
             try{
                 if (this.state == STATE.MEDIA_RUNNING) {
                     this.recorder.stop();
+                    this.recorder.release();
+                    this.streamThread.interrupt();
+                    this.streamThread = null;
                 }
-                this.recorder.reset();
+                //this.recorder.reset();
                 if (!this.tempFiles.contains(this.tempFile)) {
                     this.tempFiles.add(this.tempFile);
                 }
@@ -718,5 +756,65 @@ public class AudioPlayer implements OnCompletionListener, OnPreparedListener, On
             }
         }
         return 0;
+    }
+
+    class CMG711 {
+        /**
+         * decompress table constants
+         */
+        private short aLawDecompressTable[] = new short[]
+                {-5504, -5248, -6016, -5760, -4480, -4224, -4992, -4736, -7552, -7296, -8064, -7808, -6528, -6272, -7040, -6784, -2752, -2624, -3008, -2880, -2240, -2112, -2496, -2368, -3776, -3648, -4032, -3904, -3264, -3136, -3520, -3392, -22016, -20992, -24064, -23040, -17920, -16896, -19968, -18944, -30208, -29184, -32256, -31232, -26112, -25088, -28160, -27136, -11008, -10496, -12032, -11520, -8960, -8448, -9984, -9472, -15104, -14592, -16128, -15616, -13056, -12544, -14080, -13568, -344, -328, -376,
+                        -360, -280, -264, -312, -296, -472, -456, -504, -488, -408, -392, -440, -424, -88, -72, -120, -104, -24, -8, -56, -40, -216, -200, -248, -232, -152, -136, -184, -168, -1376, -1312, -1504, -1440, -1120, -1056, -1248, -1184, -1888, -1824, -2016, -1952, -1632, -1568, -1760, -1696, -688, -656, -752, -720, -560, -528, -624, -592, -944, -912, -1008, -976, -816, -784, -880, -848, 5504, 5248, 6016, 5760, 4480, 4224, 4992, 4736, 7552, 7296, 8064, 7808, 6528, 6272, 7040, 6784, 2752, 2624,
+                        3008, 2880, 2240, 2112, 2496, 2368, 3776, 3648, 4032, 3904, 3264, 3136, 3520, 3392, 22016, 20992, 24064, 23040, 17920, 16896, 19968, 18944, 30208, 29184, 32256, 31232, 26112, 25088, 28160, 27136, 11008, 10496, 12032, 11520, 8960, 8448, 9984, 9472, 15104, 14592, 16128, 15616, 13056, 12544, 14080, 13568, 344, 328, 376, 360, 280, 264, 312, 296, 472, 456, 504, 488, 408, 392, 440, 424, 88, 72, 120, 104, 24, 8, 56, 40, 216, 200, 248, 232, 152, 136, 184, 168, 1376, 1312, 1504, 1440, 1120,
+                        1056, 1248, 1184, 1888, 1824, 2016, 1952, 1632, 1568, 1760, 1696, 688, 656, 752, 720, 560, 528, 624, 592, 944, 912, 1008, 976, 816, 784, 880, 848};
+
+        private final static int cClip = 32635;
+        private byte aLawCompressTable[] = new byte[]
+                {1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7};
+
+        private int encode(byte[] src, int offset, int len, byte[] res) {
+            int j = offset;
+            int count = len / 2;
+            short sample = 0;
+
+            for (int i = 0; i < count; i++) {
+                sample = (short) (((src[j++] & 0xff) | (src[j++]) << 8));
+                res[i] = linearToALawSample(sample);
+            }
+            return count;
+        }
+
+        private byte linearToALawSample(short sample) {
+            int sign;
+            int exponent;
+            int mantissa;
+            int s;
+
+            sign = ((~sample) >> 8) & 0x80;
+            if (!(sign == 0x80)) {
+                sample = (short) -sample;
+            }
+            if (sample > cClip) {
+                sample = cClip;
+            }
+            if (sample >= 256) {
+                exponent = (int) aLawCompressTable[(sample >> 8) & 0x7F];
+                mantissa = (sample >> (exponent + 3)) & 0x0F;
+                s = (exponent << 4) | mantissa;
+            } else {
+                s = sample >> 4;
+            }
+            s ^= (sign ^ 0x55);
+            return (byte) s;
+        }
+
+        public void decode(byte[] src, int offset, int len, byte[] res) {
+            int j = 0;
+            for (int i = 0; i < len; i++) {
+                short s = aLawDecompressTable[src[i + offset] & 0xff];
+                res[j++] = (byte) s;
+                res[j++] = (byte) (s >> 8);
+            }
+        }
     }
 }
