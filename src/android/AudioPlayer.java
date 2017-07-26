@@ -157,16 +157,16 @@ public class AudioPlayer implements OnCompletionListener, OnPreparedListener, On
             break;
         case NONE:
 
-            if (this.state == STATE.MEDIA_STOPPED) {
-                this.streamThread = new Thread(new Runnable() {
+            if (AudioPlayer.this.state == STATE.MEDIA_STOPPED) {
+                AudioPlayer.this.streamThread = new Thread(new Runnable() {
                     @Override
                     public void run() {
                         try {
 
                             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO);
                             
-                            this.setState(STATE.MEDIA_RUNNING);
-                            this.audioFile = file;
+                            AudioPlayer.this.setState(STATE.MEDIA_RUNNING);
+                            AudioPlayer.this.audioFile = file;
 
                             byte[] buffer = new byte[4096];
 
@@ -177,12 +177,12 @@ public class AudioPlayer implements OnCompletionListener, OnPreparedListener, On
                             /////Encoding:
                             CMG711 encoder = new CMG711();
                             byte[] outBuffer = new byte[4096];
-                            this.tempFile = generateTempFile();
+                            AudioPlayer.this.tempFile = generateTempFile();
 
                             int read, encoded;
-                            FileOutputStream out = new FileOutputStream(new File(this.tempFile));
+                            FileOutputStream out = new FileOutputStream(new File(AudioPlayer.this.tempFile));
 
-                            while(this.state == STATE.MEDIA_RUNNING) {
+                            while(AudioPlayer.this.state == STATE.MEDIA_RUNNING) {
 
                                 //reading data from MIC into buffer
                                 read = recorder.read(buffer, 0, buffer.length);
