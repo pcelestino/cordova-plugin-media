@@ -745,16 +745,16 @@ public class AudioPlayer implements OnCompletionListener, OnPreparedListener, On
      * @return amplitude or 0 if not recording
      */
     public float getCurrentAmplitude() {
-        if (this.recorder != null) {
-            try{
-                if (this.state == STATE.MEDIA_RUNNING) {
-                    return (float) this.recorder.getMaxAmplitude() / 32762;
-                }
-            }
-            catch (Exception e) {
-                e.printStackTrace();
-            }
-        }
+        // if (this.recorder != null) {
+        //     try{
+        //         if (this.state == STATE.MEDIA_RUNNING) {
+        //             return (float) this.recorder.getMaxAmplitude() / 32762;
+        //         }
+        //     }
+        //     catch (Exception e) {
+        //         e.printStackTrace();
+        //     }
+        // }
         return 0;
     }
 
