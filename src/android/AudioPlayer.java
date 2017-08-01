@@ -93,6 +93,22 @@ public class AudioPlayer implements OnCompletionListener, OnPreparedListener, On
     private boolean prepareOnly = true;     // playback after file prepare flag
     private int seekOnPrepared = 0;     // seek to this location once media is prepared
 
+    // Member variables representing frame data
+    private int mSampleRate;
+    private int mChannels;
+    private int mNumSamples;  // total number of samples per channel in audio file
+    private ByteBuffer mDecodedBytes;  // Raw audio data
+    private ShortBuffer mDecodedSamples;  // shared buffer with mDecodedBytes.
+
+    // Member variables for hack (making it work with old version, until app just uses the samples).
+    private int mNumFrames;
+    private int[] mFrameGains;
+
+    // Should be removed when the app will use directly the samples instead of the frames.
+    public int getSamplesPerFrame() {
+        return 1024;  // just a fixed value here...
+    }
+
     /**
      * Constructor.
      *
@@ -148,30 +164,186 @@ public class AudioPlayer implements OnCompletionListener, OnPreparedListener, On
             sendErrorStatus(MEDIA_ERR_ABORTED);
             break;
         case NONE:
-            this.audioFile = file;
-            this.recorder = new MediaRecorder();
-            this.recorder.setAudioSource(MediaRecorder.AudioSource.MIC);
-            this.recorder.setOutputFormat(MediaRecorder.OutputFormat.AAC_ADTS); // RAW_AMR);
-            this.recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC); //AMR_NB);
-            this.tempFile = generateTempFile();
-            this.recorder.setOutputFile(this.tempFile);
-            try {
-                this.recorder.prepare();
-                this.recorder.start();
-                this.setState(STATE.MEDIA_RUNNING);
-                return;
-            } catch (IllegalStateException e) {
-                e.printStackTrace();
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
 
-            sendErrorStatus(MEDIA_ERR_ABORTED);
+            this.audioFile = file;
+            this.tempFile = generateTempFile();
+
+            streamThread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+
+                    mSampleRate = 8000; //44100;
+                    mChannels = 1;  // record mono audio.
+                    short[] buffer = new short[1024];  // buffer contains 1 mono frame of 1024 16 bits samples
+                    int minBufferSize = AudioRecord.getMinBufferSize(
+                            mSampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
+                    // make sure minBufferSize can contain at least 1 second of audio (16 bits sample).
+                    if (minBufferSize < mSampleRate * 2) {
+                        minBufferSize = mSampleRate * 2;
+                    }
+                    AudioRecord audioRecord = new AudioRecord(
+                            MediaRecorder.AudioSource.DEFAULT,
+                            mSampleRate,
+                            AudioFormat.CHANNEL_IN_MONO,
+                            AudioFormat.ENCODING_PCM_16BIT,
+                            minBufferSize
+                    );
+
+                    // Allocate memory for 20 seconds first. Reallocate later if more is needed.
+                    mDecodedBytes = ByteBuffer.allocate(20 * mSampleRate * 2);
+                    mDecodedBytes.order(ByteOrder.LITTLE_ENDIAN);
+                    mDecodedSamples = mDecodedBytes.asShortBuffer();
+                    audioRecord.startRecording();
+                    setState(STATE.MEDIA_RUNNING);
+
+                    while (state == STATE.MEDIA_RUNNING) {
+                        // check if mDecodedSamples can contain 1024 additional samples.
+                        if (mDecodedSamples.remaining() < 1024) {
+                            // Try to allocate memory for 10 additional seconds.
+                            int newCapacity = mDecodedBytes.capacity() + 10 * mSampleRate * 2;
+                            ByteBuffer newDecodedBytes;
+                            try {
+                                newDecodedBytes = ByteBuffer.allocate(newCapacity);
+                            } catch (OutOfMemoryError oome) {
+                                break;
+                            }
+                            int position = mDecodedSamples.position();
+                            mDecodedBytes.rewind();
+                            newDecodedBytes.put(mDecodedBytes);
+                            mDecodedBytes = newDecodedBytes;
+                            mDecodedBytes.order(ByteOrder.LITTLE_ENDIAN);
+                            mDecodedBytes.rewind();
+                            mDecodedSamples = mDecodedBytes.asShortBuffer();
+                            mDecodedSamples.position(position);
+                        }
+                        // TODO(nfaralli): maybe use the read method that takes a direct ByteBuffer argument.
+                        audioRecord.read(buffer, 0, buffer.length);
+                        mDecodedSamples.put(buffer);
+                    }
+                    audioRecord.stop();
+                    audioRecord.release();
+                    mNumSamples = mDecodedSamples.position();
+                    mDecodedSamples.rewind();
+                    mDecodedBytes.rewind();
+
+                    // Temporary hack to make it work with the old version.
+                    mNumFrames = mNumSamples / getSamplesPerFrame();
+                    if (mNumSamples % getSamplesPerFrame() != 0) {
+                        mNumFrames++;
+                    }
+                    mFrameGains = new int[mNumFrames];
+                    int i, j;
+                    int gain, value;
+                    for (i = 0; i < mNumFrames; i++) {
+                        gain = -1;
+                        for (j = 0; j < getSamplesPerFrame(); j++) {
+                            if (mDecodedSamples.remaining() > 0) {
+                                value = java.lang.Math.abs(mDecodedSamples.get());
+                            } else {
+                                value = 0;
+                            }
+                            if (gain < value) {
+                                gain = value;
+                            }
+                        }
+                        mFrameGains[i] = (int) Math.sqrt(gain);  // here gain = sqrt(max value of 1st channel)...
+                    }
+                    mDecodedSamples.rewind();
+
+                    try {
+                        writeWAVFile(new File(tempFile), 0, mNumFrames);
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                        sendErrorStatus(MEDIA_ERR_ABORTED);
+                    }
+                }
+            });
+            streamThread.start();
             break;
         case RECORD:
             LOG.d(LOG_TAG, "AudioPlayer Error: Already recording.");
             sendErrorStatus(MEDIA_ERR_ABORTED);
         }
+    }
+
+    // Method used to swap the left and right channels (needed for stereo WAV files).
+    // buffer contains the PCM data: {sample 1 right, sample 1 left, sample 2 right, etc.}
+    // The size of a sample is assumed to be 16 bits (for a single channel).
+    // When done, buffer will contain {sample 1 left, sample 1 right, sample 2 left, etc.}
+    private void swapLeftRightChannels(byte[] buffer) {
+        byte left[] = new byte[2];
+        byte right[] = new byte[2];
+        if (buffer.length % 4 != 0) {  // 2 channels, 2 bytes per sample (for one channel).
+            // Invalid buffer size.
+            return;
+        }
+        for (int offset = 0; offset < buffer.length; offset += 4) {
+            left[0] = buffer[offset];
+            left[1] = buffer[offset + 1];
+            right[0] = buffer[offset + 2];
+            right[1] = buffer[offset + 3];
+            buffer[offset] = right[0];
+            buffer[offset + 1] = right[1];
+            buffer[offset + 2] = left[0];
+            buffer[offset + 3] = left[1];
+        }
+    }
+
+    // should be removed in the near future...
+    public void writeWAVFile(File outputFile, int startFrame, int numFrames)
+            throws java.io.IOException {
+        float startTime = (float) startFrame * getSamplesPerFrame() / mSampleRate;
+        float endTime = (float) (startFrame + numFrames) * getSamplesPerFrame() / mSampleRate;
+        writeWAVFile(outputFile, startTime, endTime);
+    }
+
+    public void writeWAVFile(File outputFile, float startTime, float endTime)
+            throws java.io.IOException {
+        int startOffset = (int) (startTime * mSampleRate) * 2 * mChannels;
+        int numSamples = (int) ((endTime - startTime) * mSampleRate);
+
+        // Start by writing the RIFF header.
+        FileOutputStream outputStream = new FileOutputStream(outputFile);
+        outputStream.write(WAVHeader.getWAVHeader(mSampleRate, mChannels, numSamples));
+
+        // Write the samples to the file, 1024 at a time.
+        byte buffer[] = new byte[1024 * mChannels * 2];  // Each sample is coded with a short.
+        mDecodedBytes.position(startOffset);
+        int numBytesLeft = numSamples * mChannels * 2;
+        while (numBytesLeft >= buffer.length) {
+            if (mDecodedBytes.remaining() < buffer.length) {
+                // This should not happen.
+                for (int i = mDecodedBytes.remaining(); i < buffer.length; i++) {
+                    buffer[i] = 0;  // pad with extra 0s to make a full frame.
+                }
+                mDecodedBytes.get(buffer, 0, mDecodedBytes.remaining());
+            } else {
+                mDecodedBytes.get(buffer);
+            }
+            if (mChannels == 2) {
+                swapLeftRightChannels(buffer);
+            }
+            outputStream.write(buffer);
+            numBytesLeft -= buffer.length;
+        }
+        if (numBytesLeft > 0) {
+            if (mDecodedBytes.remaining() < numBytesLeft) {
+                // This should not happen.
+                for (int i = mDecodedBytes.remaining(); i < numBytesLeft; i++) {
+                    buffer[i] = 0;  // pad with extra 0s to make a full frame.
+                }
+                mDecodedBytes.get(buffer, 0, mDecodedBytes.remaining());
+            } else {
+                mDecodedBytes.get(buffer, 0, numBytesLeft);
+            }
+            if (mChannels == 2) {
+                swapLeftRightChannels(buffer);
+            }
+            outputStream.write(buffer, 0, numBytesLeft);
+        }
+        outputStream.close();
+        moveFile(audioFile);
+        streamThread.interrupt();
     }
 
     /**
@@ -258,29 +430,39 @@ public class AudioPlayer implements OnCompletionListener, OnPreparedListener, On
      * Stop/Pause recording and save to the file specified when recording started.
      */
     public void stopRecording(boolean stop) {
-        if (this.recorder != null) {
-            try{
-                if (this.state == STATE.MEDIA_RUNNING) {
-                    this.recorder.stop();
-                }
-                this.recorder.reset();
-                if (!this.tempFiles.contains(this.tempFile)) {
-                    this.tempFiles.add(this.tempFile);
-                }
-                if (stop) {
-                    LOG.d(LOG_TAG, "stopping recording");
-                    this.setState(STATE.MEDIA_STOPPED);
-                    this.moveFile(this.audioFile);
-                } else {
-                    LOG.d(LOG_TAG, "pause recording");
-                    this.setState(STATE.MEDIA_PAUSED);
-                }
-            }
-            catch (Exception e) {
-                e.printStackTrace();
-            }
+        if (!this.tempFiles.contains(this.tempFile)) {
+            this.tempFiles.add(this.tempFile);
         }
+        this.setState(STATE.MEDIA_STOPPED);
     }
+
+    // /**
+    //  * Stop/Pause recording and save to the file specified when recording started.
+    //  */
+    // public void stopRecording(boolean stop) {
+    //     if (this.recorder != null) {
+    //         try{
+    //             if (this.state == STATE.MEDIA_RUNNING) {
+    //                 this.recorder.stop();
+    //             }
+    //             this.recorder.reset();
+    //             if (!this.tempFiles.contains(this.tempFile)) {
+    //                 this.tempFiles.add(this.tempFile);
+    //             }
+    //             if (stop) {
+    //                 LOG.d(LOG_TAG, "stopping recording");
+    //                 this.setState(STATE.MEDIA_STOPPED);
+    //                 this.moveFile(this.audioFile);
+    //             } else {
+    //                 LOG.d(LOG_TAG, "pause recording");
+    //                 this.setState(STATE.MEDIA_PAUSED);
+    //             }
+    //         }
+    //         catch (Exception e) {
+    //             e.printStackTrace();
+    //         }
+    //     }
+    // }
 
     /**
      * Resume recording and save to the file specified when recording started.
